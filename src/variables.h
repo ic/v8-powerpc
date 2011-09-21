@@ -1,4 +1,4 @@
-// Copyright 2006-2008 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -33,46 +33,6 @@
 namespace v8 {
 namespace internal {
 
-// Variables and AST expression nodes can track their "type" to enable
-// optimizations and removal of redundant checks when generating code.
-
-class StaticType {
- public:
-  enum Kind {
-    UNKNOWN,
-    LIKELY_SMI
-  };
-
-  StaticType() : kind_(UNKNOWN) {}
-
-  bool Is(Kind kind) const { return kind_ == kind; }
-
-  bool IsKnown() const { return !Is(UNKNOWN); }
-  bool IsUnknown() const { return Is(UNKNOWN); }
-  bool IsLikelySmi() const { return Is(LIKELY_SMI); }
-
-  void CopyFrom(StaticType* other) {
-    kind_ = other->kind_;
-  }
-
-  static const char* Type2String(StaticType* type);
-
-  // LIKELY_SMI accessors
-  void SetAsLikelySmi() {
-    kind_ = LIKELY_SMI;
-  }
-
-  void SetAsLikelySmiIfUnknown() {
-    if (IsUnknown()) {
-      SetAsLikelySmi();
-    }
-  }
-
- private:
-  Kind kind_;
-};
-
-
 // The AST refers to variables via VariableProxies - placeholders for the actual
 // variables. Variables themselves are never directly referred to from the AST,
 // they are maintained by scopes, and referred to from VariableProxies and Slots
@@ -85,6 +45,8 @@ class Variable: public ZoneObject {
     VAR,       // declared via 'var', and 'function' declarations
 
     CONST,     // declared via 'const' declarations
+
+    LET,       // declared via 'let' declarations
 
     // Variables introduced by the compiler:
     DYNAMIC,         // always require dynamic lookup (we don't know
@@ -112,6 +74,33 @@ class Variable: public ZoneObject {
     ARGUMENTS
   };
 
+  enum Location {
+    // Before and during variable allocation, a variable whose location is
+    // not yet determined.  After allocation, a variable looked up as a
+    // property on the global object (and possibly absent).  name() is the
+    // variable name, index() is invalid.
+    UNALLOCATED,
+
+    // A slot in the parameter section on the stack.  index() is the
+    // parameter index, counting left-to-right.  The reciever is index -1;
+    // the first parameter is index 0.
+    PARAMETER,
+
+    // A slot in the local section on the stack.  index() is the variable
+    // index in the stack frame, starting at 0.
+    LOCAL,
+
+    // An indexed slot in a heap context.  index() is the variable index in
+    // the context object on the heap, starting at 0.  scope() is the
+    // corresponding scope.
+    CONTEXT,
+
+    // A named slot in a heap context.  name() is the variable name in the
+    // context object on the heap, with lookup starting at the current
+    // context.  index() is invalid.
+    LOOKUP
+  };
+
   Variable(Scope* scope,
            Handle<String> name,
            Mode mode,
@@ -121,21 +110,22 @@ class Variable: public ZoneObject {
   // Printing support
   static const char* Mode2String(Mode mode);
 
-  // Type testing & conversion
-  Property* AsProperty();
-  Variable* AsVariable();
   bool IsValidLeftHandSide() { return is_valid_LHS_; }
 
   // The source code for an eval() call may refer to a variable that is
   // in an outer scope about which we don't know anything (it may not
   // be the global scope). scope() is NULL in that case. Currently the
   // scope is only used to follow the context chain length.
-  Scope* scope() const  { return scope_; }
+  Scope* scope() const { return scope_; }
 
-  Handle<String> name() const  { return name_; }
-  Mode mode() const  { return mode_; }
-  bool is_accessed_from_inner_scope() const  {
+  Handle<String> name() const { return name_; }
+  Mode mode() const { return mode_; }
+  bool is_accessed_from_inner_scope() const {
     return is_accessed_from_inner_scope_;
+  }
+  void MarkAsAccessedFromInnerScope() {
+    ASSERT(mode_ != TEMPORARY);
+    is_accessed_from_inner_scope_ = true;
   }
   bool is_used() { return is_used_; }
   void set_is_used(bool flag) { is_used_ = flag; }
@@ -144,7 +134,12 @@ class Variable: public ZoneObject {
     return !is_this() && name().is_identical_to(n);
   }
 
-  bool IsStackAllocated() const;
+  bool IsUnallocated() const { return location_ == UNALLOCATED; }
+  bool IsParameter() const { return location_ == PARAMETER; }
+  bool IsStackLocal() const { return location_ == LOCAL; }
+  bool IsStackAllocated() const { return IsParameter() || IsStackLocal(); }
+  bool IsContextSlot() const { return location_ == CONTEXT; }
+  bool IsLookupSlot() const { return location_ == LOOKUP; }
 
   bool is_dynamic() const {
     return (mode_ == DYNAMIC ||
@@ -158,7 +153,7 @@ class Variable: public ZoneObject {
 
   // True if the variable is named eval and not known to be shadowed.
   bool is_possibly_eval() const {
-    return IsVariable(Factory::eval_symbol()) &&
+    return IsVariable(FACTORY->eval_symbol()) &&
         (mode_ == DYNAMIC || mode_ == DYNAMIC_GLOBAL);
   }
 
@@ -171,32 +166,30 @@ class Variable: public ZoneObject {
     local_if_not_shadowed_ = local;
   }
 
-  Expression* rewrite() const  { return rewrite_; }
-  Slot* slot() const;
+  Location location() const { return location_; }
+  int index() const { return index_; }
 
-  StaticType* type() { return &type_; }
+  void AllocateTo(Location location, int index) {
+    location_ = location;
+    index_ = index;
+  }
 
  private:
   Scope* scope_;
   Handle<String> name_;
   Mode mode_;
-  bool is_valid_LHS_;
   Kind kind_;
+  Location location_;
+  int index_;
 
   Variable* local_if_not_shadowed_;
+
+  // Valid as a LHS? (const and this are not valid LHS, for example)
+  bool is_valid_LHS_;
 
   // Usage info.
   bool is_accessed_from_inner_scope_;  // set by variable resolver
   bool is_used_;
-
-  // Static type information
-  StaticType type_;
-
-  // Code generation.
-  // rewrite_ is usually a Slot or a Property, but may be any expression.
-  Expression* rewrite_;
-
-  friend class Scope;  // Has explicit access to rewrite_.
 };
 
 

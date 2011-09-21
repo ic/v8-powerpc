@@ -55,7 +55,10 @@ var ZERO = (function() {
 assertEquals(0, ZERO);
 assertEquals(Infinity, 1/ZERO);
 assertEquals(-Infinity, 1/-ZERO);
-assertFalse(%_IsSmi(ZERO));
+// Here we would like to have assertFalse(%_IsSmi(ZERO));  This is, however,
+// unreliable, since a new space exhaustion at a critical moment could send
+// us into the runtime system, which would quite legitimately put a Smi zero
+// here.
 assertFalse(%_IsSmi(-ZERO));
 
 var o = {};
@@ -73,9 +76,9 @@ assertEquals(-1, Math.min(+0, -0, -1));
 assertEquals(-1, Math.min(-1, +0, -0));
 assertEquals(-1, Math.min(+0, -1, -0));
 assertEquals(-1, Math.min(-0, -1, +0));
-assertNaN(Math.min('oxen'));
-assertNaN(Math.min('oxen', 1));
-assertNaN(Math.min(1, 'oxen'));
+assertEquals(NaN, Math.min('oxen'));
+assertEquals(NaN, Math.min('oxen', 1));
+assertEquals(NaN, Math.min(1, 'oxen'));
 
 
 // Test Math.max().
@@ -106,9 +109,9 @@ assertEquals(1, Math.max(+0, -0, +1));
 assertEquals(1, Math.max(+1, +0, -0));
 assertEquals(1, Math.max(+0, +1, -0));
 assertEquals(1, Math.max(-0, +1, +0));
-assertNaN(Math.max('oxen'));
-assertNaN(Math.max('oxen', 1));
-assertNaN(Math.max(1, 'oxen'));
+assertEquals(NaN, Math.max('oxen'));
+assertEquals(NaN, Math.max('oxen', 1));
+assertEquals(NaN, Math.max(1, 'oxen'));
 
 assertEquals(Infinity, 1/Math.max(ZERO, -0));
 assertEquals(Infinity, 1/Math.max(-0, ZERO));

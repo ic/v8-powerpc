@@ -1,4 +1,4 @@
-// Copyright 2006-2008 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -66,23 +66,38 @@ static const RegList kCalleeSaved =
   1 <<  6 |  //  r6 v3
   1 <<  7 |  //  r7 v4
   1 <<  8 |  //  r8 v5 (cp in JavaScript code)
-  kR9Available
-    <<  9 |  //  r9 v6
+  kR9Available <<  9 |  //  r9 v6
   1 << 10 |  // r10 v7
   1 << 11;   // r11 v8 (fp in JavaScript code)
 
 static const int kNumCalleeSaved = 7 + kR9Available;
 
+// Double registers d8 to d15 are callee-saved.
+static const int kNumDoubleCalleeSaved = 8;
+
+
+// Number of registers for which space is reserved in safepoints. Must be a
+// multiple of 8.
+// TODO(regis): Only 8 registers may actually be sufficient. Revisit.
+static const int kNumSafepointRegisters = 16;
+
+// Define the list of registers actually saved at safepoints.
+// Note that the number of saved registers may be smaller than the reserved
+// space, i.e. kNumSafepointSavedRegisters <= kNumSafepointRegisters.
+static const RegList kSafepointSavedRegisters = kJSCallerSaved | kCalleeSaved;
+static const int kNumSafepointSavedRegisters =
+    kNumJSCallerSaved + kNumCalleeSaved;
 
 // ----------------------------------------------------
 
 
 class StackHandlerConstants : public AllStatic {
  public:
-  static const int kNextOffset  = 0 * kPointerSize;
-  static const int kStateOffset = 1 * kPointerSize;
-  static const int kFPOffset    = 2 * kPointerSize;
-  static const int kPCOffset    = 3 * kPointerSize;
+  static const int kNextOffset    = 0 * kPointerSize;
+  static const int kStateOffset   = 1 * kPointerSize;
+  static const int kContextOffset = 2 * kPointerSize;
+  static const int kFPOffset      = 3 * kPointerSize;
+  static const int kPCOffset      = 4 * kPointerSize;
 
   static const int kSize = kPCOffset + kPointerSize;
 };
@@ -96,19 +111,17 @@ class EntryFrameConstants : public AllStatic {
 
 class ExitFrameConstants : public AllStatic {
  public:
-  static const int kCodeOffset = -1 * kPointerSize;
+  static const int kCodeOffset = -2 * kPointerSize;
   static const int kSPOffset = -1 * kPointerSize;
 
-  static const int kSavedRegistersOffset = 0 * kPointerSize;
-
   // The caller fields are below the frame pointer on the stack.
-  static const int kCallerFPOffset = +0 * kPointerSize;
-  // The calling JS function is between FP and PC.
-  static const int kCallerPCOffset = +2 * kPointerSize;
+  static const int kCallerFPOffset = 0 * kPointerSize;
+  // The calling JS function is below FP.
+  static const int kCallerPCOffset = 1 * kPointerSize;
 
   // FP-relative displacement of the caller's SP.  It points just
   // below the saved PC.
-  static const int kCallerSPDisplacement = +3 * kPointerSize;
+  static const int kCallerSPDisplacement = 2 * kPointerSize;
 };
 
 
@@ -118,8 +131,8 @@ class StandardFrameConstants : public AllStatic {
   static const int kMarkerOffset      = -2 * kPointerSize;
   static const int kContextOffset     = -1 * kPointerSize;
   static const int kCallerFPOffset    =  0 * kPointerSize;
-  static const int kCallerPCOffset    = +1 * kPointerSize;
-  static const int kCallerSPOffset    = +2 * kPointerSize;
+  static const int kCallerPCOffset    =  1 * kPointerSize;
+  static const int kCallerSPOffset    =  2 * kPointerSize;
 };
 
 
@@ -127,7 +140,7 @@ class JavaScriptFrameConstants : public AllStatic {
  public:
   // FP-relative.
   static const int kLocal0Offset = StandardFrameConstants::kExpressionsOffset;
-  static const int kSavedRegistersOffset = +2 * kPointerSize;
+  static const int kLastParameterOffset = +2 * kPointerSize;
   static const int kFunctionOffset = StandardFrameConstants::kMarkerOffset;
 
   // Caller SP-relative.

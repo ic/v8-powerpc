@@ -30,10 +30,8 @@
 
 #include <string.h>
 
-#include "flags.h"
-
+#include "../include/v8stdint.h"
 extern "C" void V8_Fatal(const char* file, int line, const char* format, ...);
-void API_Fatal(const char* location, const char* format, ...);
 
 // The FATAL, UNREACHABLE and UNIMPLEMENTED macros are useful during
 // development, but they should not be relied on in the final product.
@@ -224,28 +222,6 @@ static inline void CheckNonEqualsHelper(const char* file,
 }
 
 
-namespace v8 {
-  class Value;
-  template <class T> class Handle;
-}
-
-
-void CheckNonEqualsHelper(const char* file,
-                          int line,
-                          const char* unexpected_source,
-                          v8::Handle<v8::Value> unexpected,
-                          const char* value_source,
-                          v8::Handle<v8::Value> value);
-
-
-void CheckEqualsHelper(const char* file,
-                       int line,
-                       const char* expected_source,
-                       v8::Handle<v8::Value> expected,
-                       const char* value_source,
-                       v8::Handle<v8::Value> value);
-
-
 #define CHECK_EQ(expected, value) CheckEqualsHelper(__FILE__, __LINE__, \
   #expected, expected, #value, value)
 
@@ -256,6 +232,8 @@ void CheckEqualsHelper(const char* file,
 
 #define CHECK_GT(a, b) CHECK((a) > (b))
 #define CHECK_GE(a, b) CHECK((a) >= (b))
+#define CHECK_LT(a, b) CHECK((a) < (b))
+#define CHECK_LE(a, b) CHECK((a) <= (b))
 
 
 // This is inspired by the static assertion facility in boost.  This
@@ -273,11 +251,17 @@ template <> class StaticAssertion<true> { };
 // actually causes each use to introduce a new defined type with a
 // name depending on the source line.
 template <int> class StaticAssertionHelper { };
-#define STATIC_CHECK(test)                                                  \
-  typedef                                                                   \
-    StaticAssertionHelper<sizeof(StaticAssertion<static_cast<bool>(test)>)> \
+#define STATIC_CHECK(test)                                                    \
+  typedef                                                                     \
+    StaticAssertionHelper<sizeof(StaticAssertion<static_cast<bool>((test))>)> \
     SEMI_STATIC_JOIN(__StaticAssertTypedef__, __LINE__)
 
+
+namespace v8 { namespace internal {
+
+bool EnableSlowAsserts();
+
+} }  // namespace v8::internal
 
 // The ASSERT macro is equivalent to CHECK except that it only
 // generates code in debug builds.
@@ -287,27 +271,25 @@ template <int> class StaticAssertionHelper { };
 #define ASSERT_EQ(v1, v2)    CHECK_EQ(v1, v2)
 #define ASSERT_NE(v1, v2)    CHECK_NE(v1, v2)
 #define ASSERT_GE(v1, v2)    CHECK_GE(v1, v2)
-#define SLOW_ASSERT(condition) if (FLAG_enable_slow_asserts) CHECK(condition)
+#define ASSERT_LT(v1, v2)    CHECK_LT(v1, v2)
+#define ASSERT_LE(v1, v2)    CHECK_LE(v1, v2)
+#define SLOW_ASSERT(condition) if (EnableSlowAsserts()) CHECK(condition)
 #else
 #define ASSERT_RESULT(expr)     (expr)
 #define ASSERT(condition)      ((void) 0)
 #define ASSERT_EQ(v1, v2)      ((void) 0)
 #define ASSERT_NE(v1, v2)      ((void) 0)
 #define ASSERT_GE(v1, v2)      ((void) 0)
+#define ASSERT_LT(v1, v2)      ((void) 0)
+#define ASSERT_LE(v1, v2)      ((void) 0)
 #define SLOW_ASSERT(condition) ((void) 0)
 #endif
 // Static asserts has no impact on runtime performance, so they can be
 // safely enabled in release mode. Moreover, the ((void) 0) expression
 // obeys different syntax rules than typedef's, e.g. it can't appear
 // inside class declaration, this leads to inconsistency between debug
-// and release compilation modes behaviour.
+// and release compilation modes behavior.
 #define STATIC_ASSERT(test)  STATIC_CHECK(test)
-
-
-#define ASSERT_TAG_ALIGNED(address) \
-  ASSERT((reinterpret_cast<intptr_t>(address) & kHeapObjectTagMask) == 0)
-
-#define ASSERT_SIZE_TAG_ALIGNED(size) ASSERT((size & kHeapObjectTagMask) == 0)
 
 #define ASSERT_NOT_NULL(p)  ASSERT_NE(NULL, p)
 

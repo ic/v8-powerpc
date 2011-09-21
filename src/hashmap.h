@@ -1,4 +1,4 @@
-// Copyright 2008 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -28,6 +28,8 @@
 #ifndef V8_HASHMAP_H_
 #define V8_HASHMAP_H_
 
+#include "allocation.h"
+
 namespace v8 {
 namespace internal {
 
@@ -49,14 +51,15 @@ class HashMap {
   typedef bool (*MatchFun) (void* key1, void* key2);
 
   // Dummy constructor.  This constructor doesn't set up the hash
-  // map properly so don't use it unless you have good reason.
+  // map properly so don't use it unless you have good reason (e.g.,
+  // you know that the HashMap will never be used).
   HashMap();
 
   // initial_capacity is the size of the initial hash map;
   // it must be a power of 2 (and thus must not be 0).
-  HashMap(MatchFun match,
-          Allocator* allocator = &DefaultAllocator,
-          uint32_t initial_capacity = 8);
+  explicit HashMap(MatchFun match,
+                   Allocator* allocator = &DefaultAllocator,
+                   uint32_t initial_capacity = 8);
 
   ~HashMap();
 
@@ -83,12 +86,12 @@ class HashMap {
   void Clear();
 
   // The number of (non-empty) entries in the table.
-  uint32_t occupancy() const  { return occupancy_; }
+  uint32_t occupancy() const { return occupancy_; }
 
   // The capacity of the table. The implementation
   // makes sure that occupancy is at most 80% of
   // the table capacity.
-  uint32_t capacity() const  { return capacity_; }
+  uint32_t capacity() const { return capacity_; }
 
   // Iteration
   //
@@ -108,7 +111,7 @@ class HashMap {
   uint32_t capacity_;
   uint32_t occupancy_;
 
-  Entry* map_end() const  { return map_ + capacity_; }
+  Entry* map_end() const { return map_ + capacity_; }
   Entry* Probe(void* key, uint32_t hash);
   void Initialize(uint32_t capacity);
   void Resize();

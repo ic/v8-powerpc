@@ -190,7 +190,7 @@ assertEquals(100, toNumber("000100"));
 assertEquals(Infinity,  toNumber("1e999"), "1e999");
 assertEquals(-Infinity, toNumber("-1e999"));
 assertEquals(0,         toNumber("1e-999"));
-assertEquals(0,         toNumber("-1e-999"));
+assertEquals(-0,        toNumber("-1e-999"));
 assertEquals(Infinity,  1 / toNumber("1e-999"), "1e-999");
 assertEquals(-Infinity, 1 / toNumber("-1e-999"));
 
@@ -203,3 +203,7 @@ assertTrue(isNaN(toNumber("Infinity junk")), "Infinity junk");
 assertTrue(isNaN(toNumber("1e")), "1e");
 assertTrue(isNaN(toNumber("1e ")), "1e_");
 assertTrue(isNaN(toNumber("1" + repeat('0', 1000) + 'junk')), "1e1000 junk");
+
+for (var i = 1; i < 12; i++) {
+  assertEquals(toNumber('1' + repeat('0', i)), Math.pow(10.0, i));
+}

@@ -1,4 +1,4 @@
-// Copyright 2006-2008 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -25,249 +25,238 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+// Features shared by parsing and pre-parsing scanners.
+
 #ifndef V8_SCANNER_H_
 #define V8_SCANNER_H_
 
+#include "allocation.h"
+#include "char-predicates.h"
+#include "checks.h"
+#include "globals.h"
 #include "token.h"
-#include "char-predicates-inl.h"
+#include "unicode-inl.h"
+#include "utils.h"
 
 namespace v8 {
 namespace internal {
 
+// Returns the value (0 .. 15) of a hexadecimal character c.
+// If c is not a legal hexadecimal character, returns a value < 0.
+inline int HexValue(uc32 c) {
+  c -= '0';
+  if (static_cast<unsigned>(c) <= 9) return c;
+  c = (c | 0x20) - ('a' - '0');  // detect 0x11..0x16 and 0x31..0x36.
+  if (static_cast<unsigned>(c) <= 5) return c + 10;
+  return -1;
+}
 
-class UTF8Buffer {
+
+// ---------------------------------------------------------------------
+// Buffered stream of characters, using an internal UC16 buffer.
+
+class UC16CharacterStream {
  public:
-  UTF8Buffer();
-  ~UTF8Buffer();
+  UC16CharacterStream() : pos_(0) { }
+  virtual ~UC16CharacterStream() { }
 
-  inline void AddChar(uc32 c) {
-    if (static_cast<unsigned>(c) <= unibrow::Utf8::kMaxOneByteChar) {
-      buffer_.Add(static_cast<char>(c));
-    } else {
-      AddCharSlow(c);
+  // Returns and advances past the next UC16 character in the input
+  // stream. If there are no more characters, it returns a negative
+  // value.
+  inline uc32 Advance() {
+    if (buffer_cursor_ < buffer_end_ || ReadBlock()) {
+      pos_++;
+      return static_cast<uc32>(*(buffer_cursor_++));
+    }
+    // Note: currently the following increment is necessary to avoid a
+    // parser problem! The scanner treats the final kEndOfInput as
+    // a character with a position, and does math relative to that
+    // position.
+    pos_++;
+
+    return kEndOfInput;
+  }
+
+  // Return the current position in the character stream.
+  // Starts at zero.
+  inline unsigned pos() const { return pos_; }
+
+  // Skips forward past the next character_count UC16 characters
+  // in the input, or until the end of input if that comes sooner.
+  // Returns the number of characters actually skipped. If less
+  // than character_count,
+  inline unsigned SeekForward(unsigned character_count) {
+    unsigned buffered_chars =
+        static_cast<unsigned>(buffer_end_ - buffer_cursor_);
+    if (character_count <= buffered_chars) {
+      buffer_cursor_ += character_count;
+      pos_ += character_count;
+      return character_count;
+    }
+    return SlowSeekForward(character_count);
+  }
+
+  // Pushes back the most recently read UC16 character (or negative
+  // value if at end of input), i.e., the value returned by the most recent
+  // call to Advance.
+  // Must not be used right after calling SeekForward.
+  virtual void PushBack(int32_t character) = 0;
+
+ protected:
+  static const uc32 kEndOfInput = -1;
+
+  // Ensures that the buffer_cursor_ points to the character at
+  // position pos_ of the input, if possible. If the position
+  // is at or after the end of the input, return false. If there
+  // are more characters available, return true.
+  virtual bool ReadBlock() = 0;
+  virtual unsigned SlowSeekForward(unsigned character_count) = 0;
+
+  const uc16* buffer_cursor_;
+  const uc16* buffer_end_;
+  unsigned pos_;
+};
+
+
+class UnicodeCache {
+// ---------------------------------------------------------------------
+// Caching predicates used by scanners.
+ public:
+  UnicodeCache() {}
+  typedef unibrow::Utf8InputBuffer<1024> Utf8Decoder;
+
+  StaticResource<Utf8Decoder>* utf8_decoder() {
+    return &utf8_decoder_;
+  }
+
+  bool IsIdentifierStart(unibrow::uchar c) { return kIsIdentifierStart.get(c); }
+  bool IsIdentifierPart(unibrow::uchar c) { return kIsIdentifierPart.get(c); }
+  bool IsLineTerminator(unibrow::uchar c) { return kIsLineTerminator.get(c); }
+  bool IsWhiteSpace(unibrow::uchar c) { return kIsWhiteSpace.get(c); }
+
+ private:
+  unibrow::Predicate<IdentifierStart, 128> kIsIdentifierStart;
+  unibrow::Predicate<IdentifierPart, 128> kIsIdentifierPart;
+  unibrow::Predicate<unibrow::LineTerminator, 128> kIsLineTerminator;
+  unibrow::Predicate<unibrow::WhiteSpace, 128> kIsWhiteSpace;
+  StaticResource<Utf8Decoder> utf8_decoder_;
+
+  DISALLOW_COPY_AND_ASSIGN(UnicodeCache);
+};
+
+
+// ----------------------------------------------------------------------------
+// LiteralBuffer -  Collector of chars of literals.
+
+class LiteralBuffer {
+ public:
+  LiteralBuffer() : is_ascii_(true), position_(0), backing_store_() { }
+
+  ~LiteralBuffer() {
+    if (backing_store_.length() > 0) {
+      backing_store_.Dispose();
     }
   }
 
-  void StartLiteral() {
-    buffer_.StartSequence();
+  inline void AddChar(uc16 character) {
+    if (position_ >= backing_store_.length()) ExpandBuffer();
+    if (is_ascii_) {
+      if (character < kMaxAsciiCharCodeU) {
+        backing_store_[position_] = static_cast<byte>(character);
+        position_ += kASCIISize;
+        return;
+      }
+      ConvertToUC16();
+    }
+    *reinterpret_cast<uc16*>(&backing_store_[position_]) = character;
+    position_ += kUC16Size;
   }
 
-  Vector<const char> EndLiteral() {
-    buffer_.Add(kEndMarker);
-    Vector<char> sequence = buffer_.EndSequence();
-    return Vector<const char>(sequence.start(), sequence.length());
+  bool is_ascii() { return is_ascii_; }
+
+  Vector<const uc16> uc16_literal() {
+    ASSERT(!is_ascii_);
+    ASSERT((position_ & 0x1) == 0);
+    return Vector<const uc16>(
+        reinterpret_cast<const uc16*>(backing_store_.start()),
+        position_ >> 1);
   }
 
-  void DropLiteral() {
-    buffer_.DropSequence();
+  Vector<const char> ascii_literal() {
+    ASSERT(is_ascii_);
+    return Vector<const char>(
+        reinterpret_cast<const char*>(backing_store_.start()),
+        position_);
+  }
+
+  int length() {
+    return is_ascii_ ? position_ : (position_ >> 1);
   }
 
   void Reset() {
-    buffer_.Reset();
-  }
-
-  // The end marker added after a parsed literal.
-  // Using zero allows the usage of strlen and similar functions on
-  // identifiers and numbers (but not strings, since they may contain zero
-  // bytes).
-  // TODO(lrn): Use '\xff' as end marker, since it cannot occur inside
-  // an utf-8 string. This requires changes in all places that uses
-  // str-functions on the literals, but allows a single pointer to represent
-  // the literal, even if it contains embedded zeros.
-  static const char kEndMarker = '\x00';
- private:
-  static const int kInitialCapacity = 256;
-  SequenceCollector<char, 4> buffer_;
-
-  void AddCharSlow(uc32 c);
-};
-
-
-// Interface through which the scanner reads characters from the input source.
-class UTF16Buffer {
- public:
-  UTF16Buffer();
-  virtual ~UTF16Buffer() {}
-
-  virtual void PushBack(uc32 ch) = 0;
-  // Returns a value < 0 when the buffer end is reached.
-  virtual uc32 Advance() = 0;
-  virtual void SeekForward(int pos) = 0;
-
-  int pos() const { return pos_; }
-
- protected:
-  int pos_;  // Current position in the buffer.
-  int end_;  // Position where scanning should stop (EOF).
-};
-
-
-// UTF16 buffer to read characters from a character stream.
-class CharacterStreamUTF16Buffer: public UTF16Buffer {
- public:
-  CharacterStreamUTF16Buffer();
-  virtual ~CharacterStreamUTF16Buffer() {}
-  void Initialize(Handle<String> data,
-                  unibrow::CharacterStream* stream,
-                  int start_position,
-                  int end_position);
-  virtual void PushBack(uc32 ch);
-  virtual uc32 Advance();
-  virtual void SeekForward(int pos);
-
- private:
-  List<uc32> pushback_buffer_;
-  uc32 last_;
-  unibrow::CharacterStream* stream_;
-
-  List<uc32>* pushback_buffer() { return &pushback_buffer_; }
-};
-
-
-// UTF16 buffer to read characters from an external string.
-template <typename StringType, typename CharType>
-class ExternalStringUTF16Buffer: public UTF16Buffer {
- public:
-  ExternalStringUTF16Buffer();
-  virtual ~ExternalStringUTF16Buffer() {}
-  void Initialize(Handle<StringType> data,
-                  int start_position,
-                  int end_position);
-  virtual void PushBack(uc32 ch);
-  virtual uc32 Advance();
-  virtual void SeekForward(int pos);
-
- private:
-  const CharType* raw_data_;  // Pointer to the actual array of characters.
-};
-
-
-class KeywordMatcher {
-//  Incrementally recognize keywords.
-//
-//  Recognized keywords:
-//      break case catch const* continue debugger* default delete do else
-//      finally false for function if in instanceof native* new null
-//      return switch this throw true try typeof var void while with
-//
-//  *: Actually "future reserved keywords". These are the only ones we
-//     recognized, the remaining are allowed as identifiers.
- public:
-  KeywordMatcher()
-      : state_(INITIAL),
-        token_(Token::IDENTIFIER),
-        keyword_(NULL),
-        counter_(0),
-        keyword_token_(Token::ILLEGAL) {}
-
-  Token::Value token() { return token_; }
-
-  inline void AddChar(uc32 input) {
-    if (state_ != UNMATCHABLE) {
-      Step(input);
-    }
-  }
-
-  void Fail() {
-    token_ = Token::IDENTIFIER;
-    state_ = UNMATCHABLE;
+    position_ = 0;
+    is_ascii_ = true;
   }
 
  private:
-  enum State {
-    UNMATCHABLE,
-    INITIAL,
-    KEYWORD_PREFIX,
-    KEYWORD_MATCHED,
-    C,
-    CA,
-    CO,
-    CON,
-    D,
-    DE,
-    F,
-    I,
-    IN,
-    N,
-    T,
-    TH,
-    TR,
-    V,
-    W
-  };
-
-  struct FirstState {
-    const char* keyword;
-    State state;
-    Token::Value token;
-  };
-
-  // Range of possible first characters of a keyword.
-  static const unsigned int kFirstCharRangeMin = 'b';
-  static const unsigned int kFirstCharRangeMax = 'w';
-  static const unsigned int kFirstCharRangeLength =
-      kFirstCharRangeMax - kFirstCharRangeMin + 1;
-  // State map for first keyword character range.
-  static FirstState first_states_[kFirstCharRangeLength];
-
-  // If input equals keyword's character at position, continue matching keyword
-  // from that position.
-  inline bool MatchKeywordStart(uc32 input,
-                                const char* keyword,
-                                int position,
-                                Token::Value token_if_match) {
-    if (input == keyword[position]) {
-      state_ = KEYWORD_PREFIX;
-      this->keyword_ = keyword;
-      this->counter_ = position + 1;
-      this->keyword_token_ = token_if_match;
-      return true;
-    }
-    return false;
+  static const int kInitialCapacity = 16;
+  static const int kGrowthFactory = 4;
+  static const int kMinConversionSlack = 256;
+  static const int kMaxGrowth = 1 * MB;
+  inline int NewCapacity(int min_capacity) {
+    int capacity = Max(min_capacity, backing_store_.length());
+    int new_capacity = Min(capacity * kGrowthFactory, capacity + kMaxGrowth);
+    return new_capacity;
   }
 
-  // If input equals match character, transition to new state and return true.
-  inline bool MatchState(uc32 input, char match, State new_state) {
-    if (input == match) {
-      state_ = new_state;
-      return true;
-    }
-    return false;
+  void ExpandBuffer() {
+    Vector<byte> new_store = Vector<byte>::New(NewCapacity(kInitialCapacity));
+    memcpy(new_store.start(), backing_store_.start(), position_);
+    backing_store_.Dispose();
+    backing_store_ = new_store;
   }
 
-  inline bool MatchKeyword(uc32 input,
-                           char match,
-                           State new_state,
-                           Token::Value keyword_token) {
-    if (input != match) {
-      return false;
+  void ConvertToUC16() {
+    ASSERT(is_ascii_);
+    Vector<byte> new_store;
+    int new_content_size = position_ * kUC16Size;
+    if (new_content_size >= backing_store_.length()) {
+      // Ensure room for all currently read characters as UC16 as well
+      // as the character about to be stored.
+      new_store = Vector<byte>::New(NewCapacity(new_content_size));
+    } else {
+      new_store = backing_store_;
     }
-    state_ = new_state;
-    token_ = keyword_token;
-    return true;
+    char* src = reinterpret_cast<char*>(backing_store_.start());
+    uc16* dst = reinterpret_cast<uc16*>(new_store.start());
+    for (int i = position_ - 1; i >= 0; i--) {
+      dst[i] = src[i];
+    }
+    if (new_store.start() != backing_store_.start()) {
+      backing_store_.Dispose();
+      backing_store_ = new_store;
+    }
+    position_ = new_content_size;
+    is_ascii_ = false;
   }
 
-  void Step(uc32 input);
+  bool is_ascii_;
+  int position_;
+  Vector<byte> backing_store_;
 
-  // Current state.
-  State state_;
-  // Token for currently added characters.
-  Token::Value token_;
-
-  // Matching a specific keyword string (there is only one possible valid
-  // keyword with the current prefix).
-  const char* keyword_;
-  int counter_;
-  Token::Value keyword_token_;
+  DISALLOW_COPY_AND_ASSIGN(LiteralBuffer);
 };
 
 
-enum ParserMode { PARSE, PREPARSE };
-enum ParserLanguage { JAVASCRIPT, JSON };
+// ----------------------------------------------------------------------------
+// Scanner base-class.
 
-
+// Generic functionality used by both JSON and JavaScript scanners.
 class Scanner {
  public:
+  // -1 is outside of the range of any real source code.
+  static const int kNoOctalLocation = -1;
+
   typedef unibrow::Utf8InputBuffer<1024> Utf8Decoder;
 
   class LiteralScope {
@@ -281,41 +270,32 @@ class Scanner {
     bool complete_;
   };
 
-  // Construction
-  explicit Scanner(ParserMode parse_mode);
+  explicit Scanner(UnicodeCache* scanner_contants);
 
-  // Initialize the Scanner to scan source.
-  void Initialize(Handle<String> source,
-                  ParserLanguage language);
-  void Initialize(Handle<String> source,
-                  unibrow::CharacterStream* stream,
-                  ParserLanguage language);
-  void Initialize(Handle<String> source,
-                  int start_position, int end_position,
-                  ParserLanguage language);
-
-  // Returns the next token.
-  Token::Value Next();
+  // Returns the current token again.
+  Token::Value current_token() { return current_.token; }
 
   // One token look-ahead (past the token returned by Next()).
-  Token::Value peek() const  { return next_.token; }
-
-  // Returns true if there was a line terminator before the peek'ed token.
-  bool has_line_terminator_before_next() const {
-    return has_line_terminator_before_next_;
-  }
+  Token::Value peek() const { return next_.token; }
 
   struct Location {
     Location(int b, int e) : beg_pos(b), end_pos(e) { }
     Location() : beg_pos(0), end_pos(0) { }
+
+    bool IsValid() const {
+      return beg_pos >= 0 && end_pos >= beg_pos;
+    }
+
+    static Location invalid() { return Location(-1, -1); }
+
     int beg_pos;
     int end_pos;
   };
 
   // Returns the location information for the current token
   // (the token returned by Next()).
-  Location location() const  { return current_.location; }
-  Location peek_location() const  { return next_.location; }
+  Location location() const { return current_.location; }
+  Location peek_location() const { return next_.location; }
 
   // Returns the literal string, if any, for the current token (the
   // token returned by Next()). The string is 0-terminated and in
@@ -323,35 +303,186 @@ class Scanner {
   // collected for identifiers, strings, and numbers.
   // These functions only give the correct result if the literal
   // was scanned between calls to StartLiteral() and TerminateLiteral().
-  const char* literal_string() const {
-    return current_.literal_chars.start();
+  bool is_literal_ascii() {
+    ASSERT_NOT_NULL(current_.literal_chars);
+    return current_.literal_chars->is_ascii();
   }
-
+  Vector<const char> literal_ascii_string() {
+    ASSERT_NOT_NULL(current_.literal_chars);
+    return current_.literal_chars->ascii_literal();
+  }
+  Vector<const uc16> literal_uc16_string() {
+    ASSERT_NOT_NULL(current_.literal_chars);
+    return current_.literal_chars->uc16_literal();
+  }
   int literal_length() const {
-    // Excluding terminal '\x00' added by TerminateLiteral().
-    return current_.literal_chars.length() - 1;
+    ASSERT_NOT_NULL(current_.literal_chars);
+    return current_.literal_chars->length();
   }
 
-  Vector<const char> literal() const {
-    return Vector<const char>(literal_string(), literal_length());
+  bool literal_contains_escapes() const {
+    Location location = current_.location;
+    int source_length = (location.end_pos - location.beg_pos);
+    if (current_.token == Token::STRING) {
+      // Subtract delimiters.
+      source_length -= 2;
+    }
+    return current_.literal_chars->length() != source_length;
   }
 
   // Returns the literal string for the next token (the token that
   // would be returned if Next() were called).
-  const char* next_literal_string() const {
-    return next_.literal_chars.start();
+  bool is_next_literal_ascii() {
+    ASSERT_NOT_NULL(next_.literal_chars);
+    return next_.literal_chars->is_ascii();
   }
-
-
-  // Returns the length of the next token (that would be returned if
-  // Next() were called).
+  Vector<const char> next_literal_ascii_string() {
+    ASSERT_NOT_NULL(next_.literal_chars);
+    return next_.literal_chars->ascii_literal();
+  }
+  Vector<const uc16> next_literal_uc16_string() {
+    ASSERT_NOT_NULL(next_.literal_chars);
+    return next_.literal_chars->uc16_literal();
+  }
   int next_literal_length() const {
-    // Excluding terminal '\x00' added by TerminateLiteral().
-    return next_.literal_chars.length() - 1;
+    ASSERT_NOT_NULL(next_.literal_chars);
+    return next_.literal_chars->length();
   }
 
-  Vector<const char> next_literal() const {
-    return Vector<const char>(next_literal_string(), next_literal_length());
+  UnicodeCache* unicode_cache() { return unicode_cache_; }
+
+  static const int kCharacterLookaheadBufferSize = 1;
+
+ protected:
+  // The current and look-ahead token.
+  struct TokenDesc {
+    Token::Value token;
+    Location location;
+    LiteralBuffer* literal_chars;
+  };
+
+  // Call this after setting source_ to the input.
+  void Init() {
+    // Set c0_ (one character ahead)
+    STATIC_ASSERT(kCharacterLookaheadBufferSize == 1);
+    Advance();
+    // Initialize current_ to not refer to a literal.
+    current_.literal_chars = NULL;
+  }
+
+  // Literal buffer support
+  inline void StartLiteral() {
+    LiteralBuffer* free_buffer = (current_.literal_chars == &literal_buffer1_) ?
+            &literal_buffer2_ : &literal_buffer1_;
+    free_buffer->Reset();
+    next_.literal_chars = free_buffer;
+  }
+
+  inline void AddLiteralChar(uc32 c) {
+    ASSERT_NOT_NULL(next_.literal_chars);
+    next_.literal_chars->AddChar(c);
+  }
+
+  // Complete scanning of a literal.
+  inline void TerminateLiteral() {
+    // Does nothing in the current implementation.
+  }
+
+  // Stops scanning of a literal and drop the collected characters,
+  // e.g., due to an encountered error.
+  inline void DropLiteral() {
+    next_.literal_chars = NULL;
+  }
+
+  inline void AddLiteralCharAdvance() {
+    AddLiteralChar(c0_);
+    Advance();
+  }
+
+  // Low-level scanning support.
+  void Advance() { c0_ = source_->Advance(); }
+  void PushBack(uc32 ch) {
+    source_->PushBack(c0_);
+    c0_ = ch;
+  }
+
+  inline Token::Value Select(Token::Value tok) {
+    Advance();
+    return tok;
+  }
+
+  inline Token::Value Select(uc32 next, Token::Value then, Token::Value else_) {
+    Advance();
+    if (c0_ == next) {
+      Advance();
+      return then;
+    } else {
+      return else_;
+    }
+  }
+
+  uc32 ScanHexNumber(int expected_length);
+
+  // Return the current source position.
+  int source_pos() {
+    return source_->pos() - kCharacterLookaheadBufferSize;
+  }
+
+  UnicodeCache* unicode_cache_;
+
+  // Buffers collecting literal strings, numbers, etc.
+  LiteralBuffer literal_buffer1_;
+  LiteralBuffer literal_buffer2_;
+
+  TokenDesc current_;  // desc for current token (as returned by Next())
+  TokenDesc next_;     // desc for next token (one token look-ahead)
+
+  // Input stream. Must be initialized to an UC16CharacterStream.
+  UC16CharacterStream* source_;
+
+  // One Unicode character look-ahead; c0_ < 0 at the end of the input.
+  uc32 c0_;
+};
+
+// ----------------------------------------------------------------------------
+// JavaScriptScanner - base logic for JavaScript scanning.
+
+class JavaScriptScanner : public Scanner {
+ public:
+  // A LiteralScope that disables recording of some types of JavaScript
+  // literals. If the scanner is configured to not record the specific
+  // type of literal, the scope will not call StartLiteral.
+  class LiteralScope {
+   public:
+    explicit LiteralScope(JavaScriptScanner* self)
+        : scanner_(self), complete_(false) {
+      scanner_->StartLiteral();
+    }
+     ~LiteralScope() {
+       if (!complete_) scanner_->DropLiteral();
+     }
+    void Complete() {
+      scanner_->TerminateLiteral();
+      complete_ = true;
+    }
+
+   private:
+    JavaScriptScanner* scanner_;
+    bool complete_;
+  };
+
+  explicit JavaScriptScanner(UnicodeCache* scanner_contants);
+
+  void Initialize(UC16CharacterStream* source);
+
+  // Returns the next token.
+  Token::Value Next();
+
+  // Returns true if there was a line terminator before the peek'ed token,
+  // possibly inside a multi-line comment.
+  bool HasAnyLineTerminatorBeforeNext() const {
+    return has_line_terminator_before_next_ ||
+           has_multiline_comment_before_next_;
   }
 
   // Scans the input as a regular expression pattern, previous
@@ -361,159 +492,71 @@ class Scanner {
   // be empty).
   bool ScanRegExpFlags();
 
+  // Tells whether the buffer contains an identifier (no escapes).
+  // Used for checking if a property name is an identifier.
+  static bool IsIdentifier(unibrow::CharacterStream* buffer);
+
+  // Scans octal escape sequence. Also accepts "\0" decimal escape sequence.
+  uc32 ScanOctalEscape(uc32 c, int length);
+
+  // Returns the location of the last seen octal literal
+  Location octal_position() const { return octal_pos_; }
+  void clear_octal_position() { octal_pos_ = Location::invalid(); }
+
   // Seek forward to the given position.  This operation does not
   // work in general, for instance when there are pushed back
   // characters, but works for seeking forward until simple delimiter
   // tokens, which is what it is used for.
   void SeekForward(int pos);
 
-  bool stack_overflow() { return stack_overflow_; }
-
-  static StaticResource<Utf8Decoder>* utf8_decoder() { return &utf8_decoder_; }
-
-  // Tells whether the buffer contains an identifier (no escapes).
-  // Used for checking if a property name is an identifier.
-  static bool IsIdentifier(unibrow::CharacterStream* buffer);
-
-  static unibrow::Predicate<IdentifierStart, 128> kIsIdentifierStart;
-  static unibrow::Predicate<IdentifierPart, 128> kIsIdentifierPart;
-  static unibrow::Predicate<unibrow::LineTerminator, 128> kIsLineTerminator;
-  static unibrow::Predicate<unibrow::WhiteSpace, 128> kIsWhiteSpace;
-
-  static const int kCharacterLookaheadBufferSize = 1;
-  static const int kNoEndPosition = 1;
-
- private:
-  // The current and look-ahead token.
-  struct TokenDesc {
-    Token::Value token;
-    Location location;
-    Vector<const char> literal_chars;
-  };
-
-  void Init(Handle<String> source,
-            unibrow::CharacterStream* stream,
-            int start_position, int end_position,
-            ParserLanguage language);
-
-  // Literal buffer support
-  inline void StartLiteral();
-  inline void AddChar(uc32 ch);
-  inline void AddCharAdvance();
-  inline void TerminateLiteral();
-  // Stops scanning of a literal, e.g., due to an encountered error.
-  inline void DropLiteral();
-
-  // Low-level scanning support.
-  void Advance() { c0_ = source_->Advance(); }
-  void PushBack(uc32 ch) {
-    source_->PushBack(ch);
-    c0_ = ch;
+  bool HarmonyBlockScoping() const {
+    return harmony_block_scoping_;
+  }
+  void SetHarmonyBlockScoping(bool block_scoping) {
+    harmony_block_scoping_ = block_scoping;
   }
 
-  bool SkipWhiteSpace() {
-    if (is_parsing_json_) {
-      return SkipJsonWhiteSpace();
-    } else {
-      return SkipJavaScriptWhiteSpace();
-    }
-  }
 
-  bool SkipJavaScriptWhiteSpace();
-  bool SkipJsonWhiteSpace();
+ protected:
+  bool SkipWhiteSpace();
   Token::Value SkipSingleLineComment();
   Token::Value SkipMultiLineComment();
 
-  inline Token::Value Select(Token::Value tok);
-  inline Token::Value Select(uc32 next, Token::Value then, Token::Value else_);
-
-  inline void Scan() {
-    if (is_parsing_json_) {
-      ScanJson();
-    } else {
-      ScanJavaScript();
-    }
-  }
-
   // Scans a single JavaScript token.
-  void ScanJavaScript();
-
-  // Scan a single JSON token. The JSON lexical grammar is specified in the
-  // ECMAScript 5 standard, section 15.12.1.1.
-  // Recognizes all of the single-character tokens directly, or calls a function
-  // to scan a number, string or identifier literal.
-  // The only allowed whitespace characters between tokens are tab,
-  // carrige-return, newline and space.
-  void ScanJson();
-
-  // A JSON number (production JSONNumber) is a subset of the valid JavaScript
-  // decimal number literals.
-  // It includes an optional minus sign, must have at least one
-  // digit before and after a decimal point, may not have prefixed zeros (unless
-  // the integer part is zero), and may include an exponent part (e.g., "e-10").
-  // Hexadecimal and octal numbers are not allowed.
-  Token::Value ScanJsonNumber();
-
-  // A JSON string (production JSONString) is subset of valid JavaScript string
-  // literals. The string must only be double-quoted (not single-quoted), and
-  // the only allowed backslash-escapes are ", /, \, b, f, n, r, t and
-  // four-digit hex escapes (uXXXX). Any other use of backslashes is invalid.
-  Token::Value ScanJsonString();
-
-  // Used to recognizes one of the literals "true", "false", or "null". These
-  // are the only valid JSON identifiers (productions JSONBooleanLiteral,
-  // JSONNullLiteral).
-  Token::Value ScanJsonIdentifier(const char* text, Token::Value token);
+  void Scan();
 
   void ScanDecimalDigits();
   Token::Value ScanNumber(bool seen_period);
-  Token::Value ScanIdentifier();
-  uc32 ScanHexEscape(uc32 c, int length);
-  uc32 ScanOctalEscape(uc32 c, int length);
+  Token::Value ScanIdentifierOrKeyword();
+  Token::Value ScanIdentifierSuffix(LiteralScope* literal);
+
   void ScanEscape();
   Token::Value ScanString();
 
   // Scans a possible HTML comment -- begins with '<!'.
   Token::Value ScanHtmlComment();
 
-  // Return the current source position.
-  int source_pos() {
-    return source_->pos() - kCharacterLookaheadBufferSize;
-  }
-
   // Decodes a unicode escape-sequence which is part of an identifier.
-  // If the escape sequence cannot be decoded the result is kBadRune.
+  // If the escape sequence cannot be decoded the result is kBadChar.
   uc32 ScanIdentifierUnicodeEscape();
+  // Recognizes a uniocde escape-sequence and adds its characters,
+  // uninterpreted, to the current literal. Used for parsing RegExp
+  // flags.
+  bool ScanLiteralUnicodeEscape();
 
-  TokenDesc current_;  // desc for current token (as returned by Next())
-  TokenDesc next_;     // desc for next token (one token look-ahead)
+  // Start position of the octal literal last scanned.
+  Location octal_pos_;
+
+  // Whether there is a line terminator whitespace character after
+  // the current token, and  before the next. Does not count newlines
+  // inside multiline comments.
   bool has_line_terminator_before_next_;
-  bool is_pre_parsing_;
-  bool is_parsing_json_;
-
-  // Different UTF16 buffers used to pull characters from. Based on input one of
-  // these will be initialized as the actual data source.
-  CharacterStreamUTF16Buffer char_stream_buffer_;
-  ExternalStringUTF16Buffer<ExternalTwoByteString, uint16_t>
-      two_byte_string_buffer_;
-  ExternalStringUTF16Buffer<ExternalAsciiString, char> ascii_string_buffer_;
-
-  // Source. Will point to one of the buffers declared above.
-  UTF16Buffer* source_;
-
-  // Used to convert the source string into a character stream when a stream
-  // is not passed to the scanner.
-  SafeStringInputBuffer safe_string_input_buffer_;
-
-  // Buffer to hold literal values (identifiers, strings, numbers)
-  // using '\x00'-terminated UTF-8 encoding. Handles allocation internally.
-  UTF8Buffer literal_buffer_;
-
-  bool stack_overflow_;
-  static StaticResource<Utf8Decoder> utf8_decoder_;
-
-  // One Unicode character look-ahead; c0_ < 0 at the end of the input.
-  uc32 c0_;
+  // Whether there is a multi-line comment that contains a
+  // line-terminator after the current token, and before the next.
+  bool has_multiline_comment_before_next_;
+  // Whether we scan 'let' as a keyword for harmony block scoped
+  // let bindings.
+  bool harmony_block_scoping_;
 };
 
 } }  // namespace v8::internal

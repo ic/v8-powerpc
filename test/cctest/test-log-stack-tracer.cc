@@ -1,19 +1,43 @@
-// Copyright 2006-2009 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//     * Redistributions of source code must retain the above copyright
+//       notice, this list of conditions and the following disclaimer.
+//     * Redistributions in binary form must reproduce the above
+//       copyright notice, this list of conditions and the following
+//       disclaimer in the documentation and/or other materials provided
+//       with the distribution.
+//     * Neither the name of Google Inc. nor the names of its
+//       contributors may be used to endorse or promote products derived
+//       from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
 // Tests of profiler-related functions from log.h
-
-#ifdef ENABLE_LOGGING_AND_PROFILING
 
 #include <stdlib.h>
 
 #include "v8.h"
 
+#include "api.h"
 #include "codegen.h"
 #include "log.h"
-#include "top.h"
+#include "isolate.h"
 #include "cctest.h"
 #include "disassembler.h"
-#include "register-allocator-inl.h"
+#include "vm-state-inl.h"
 
 using v8::Function;
 using v8::Local;
@@ -25,12 +49,10 @@ using v8::Value;
 using v8::internal::byte;
 using v8::internal::Address;
 using v8::internal::Handle;
+using v8::internal::Isolate;
 using v8::internal::JSFunction;
 using v8::internal::StackTracer;
 using v8::internal::TickSample;
-using v8::internal::Top;
-
-namespace i = v8::internal;
 
 
 static v8::Persistent<v8::Context> env;
@@ -51,18 +73,19 @@ static void DoTrace(Address fp) {
   // sp is only used to define stack high bound
   trace_env.sample->sp =
       reinterpret_cast<Address>(trace_env.sample) - 10240;
-  StackTracer::Trace(trace_env.sample);
+  StackTracer::Trace(Isolate::Current(), trace_env.sample);
 }
 
 
 // Hide c_entry_fp to emulate situation when sampling is done while
 // pure JS code is being executed
 static void DoTraceHideCEntryFPAddress(Address fp) {
-  v8::internal::Address saved_c_frame_fp = *(Top::c_entry_fp_address());
+  v8::internal::Address saved_c_frame_fp =
+      *(Isolate::Current()->c_entry_fp_address());
   CHECK(saved_c_frame_fp);
-  *(Top::c_entry_fp_address()) = 0;
+  *(Isolate::Current()->c_entry_fp_address()) = 0;
   DoTrace(fp);
-  *(Top::c_entry_fp_address()) = saved_c_frame_fp;
+  *(Isolate::Current()->c_entry_fp_address()) = saved_c_frame_fp;
 }
 
 
@@ -107,11 +130,17 @@ v8::Handle<v8::FunctionTemplate> TraceExtension::GetNativeFunction(
 
 
 Address TraceExtension::GetFP(const v8::Arguments& args) {
-  CHECK_EQ(1, args.Length());
-  // CodeGenerator::GenerateGetFramePointer pushes EBP / RBP value
-  // on stack. In 64-bit mode we can't use Smi operations code because
-  // they check that value is within Smi bounds.
+  // Convert frame pointer from encoding as smis in the arguments to a pointer.
+  CHECK_EQ(2, args.Length());  // Ignore second argument on 32-bit platform.
+#if defined(V8_HOST_ARCH_32_BIT)
   Address fp = *reinterpret_cast<Address*>(*args[0]);
+#elif defined(V8_HOST_ARCH_64_BIT)
+  int64_t low_bits = *reinterpret_cast<uint64_t*>(*args[0]) >> 32;
+  int64_t high_bits = *reinterpret_cast<uint64_t*>(*args[1]);
+  Address fp = reinterpret_cast<Address>(high_bits | low_bits);
+#else
+#error Host architecture is neither 32-bit nor 64-bit.
+#endif
   printf("Trace: %p\n", fp);
   return fp;
 }
@@ -130,8 +159,8 @@ v8::Handle<v8::Value> TraceExtension::JSTrace(const v8::Arguments& args) {
 
 
 static Address GetJsEntrySp() {
-  CHECK_NE(NULL, Top::GetCurrentThread());
-  return Top::js_entry_sp(Top::GetCurrentThread());
+  CHECK_NE(NULL, i::Isolate::Current()->thread_local_top());
+  return Isolate::js_entry_sp(i::Isolate::Current()->thread_local_top());
 }
 
 
@@ -168,116 +197,86 @@ static void InitializeVM() {
 }
 
 
-static Handle<JSFunction> CompileFunction(const char* source) {
-  Handle<JSFunction> result(JSFunction::cast(
-      *v8::Utils::OpenHandle(*Script::Compile(String::New(source)))));
-  return result;
+static bool IsAddressWithinFuncCode(JSFunction* function, Address addr) {
+  i::Code* code = function->code();
+  return code->contains(addr);
+}
+
+static bool IsAddressWithinFuncCode(const char* func_name, Address addr) {
+  v8::Local<v8::Value> func = env->Global()->Get(v8_str(func_name));
+  CHECK(func->IsFunction());
+  JSFunction* js_func = JSFunction::cast(*v8::Utils::OpenHandle(*func));
+  return IsAddressWithinFuncCode(js_func, addr);
 }
 
 
-static Local<Value> GetGlobalProperty(const char* name) {
-  return env->Global()->Get(String::New(name));
+// This C++ function is called as a constructor, to grab the frame pointer
+// from the calling function.  When this function runs, the stack contains
+// a C_Entry frame and a Construct frame above the calling function's frame.
+static v8::Handle<Value> construct_call(const v8::Arguments& args) {
+  i::StackFrameIterator frame_iterator;
+  CHECK(frame_iterator.frame()->is_exit());
+  frame_iterator.Advance();
+  CHECK(frame_iterator.frame()->is_construct());
+  frame_iterator.Advance();
+  i::StackFrame* calling_frame = frame_iterator.frame();
+  CHECK(calling_frame->is_java_script());
+
+#if defined(V8_HOST_ARCH_32_BIT)
+  int32_t low_bits = reinterpret_cast<int32_t>(calling_frame->fp());
+  args.This()->Set(v8_str("low_bits"), v8_num(low_bits >> 1));
+#elif defined(V8_HOST_ARCH_64_BIT)
+  uint64_t fp = reinterpret_cast<uint64_t>(calling_frame->fp());
+  int32_t low_bits = static_cast<int32_t>(fp & 0xffffffff);
+  int32_t high_bits = static_cast<int32_t>(fp >> 32);
+  args.This()->Set(v8_str("low_bits"), v8_num(low_bits));
+  args.This()->Set(v8_str("high_bits"), v8_num(high_bits));
+#else
+#error Host architecture is neither 32-bit nor 64-bit.
+#endif
+  return args.This();
 }
 
 
-static Handle<JSFunction> GetGlobalJSFunction(const char* name) {
-  Handle<JSFunction> result(JSFunction::cast(
-      *v8::Utils::OpenHandle(*GetGlobalProperty(name))));
-  return result;
+// Use the API to create a JSFunction object that calls the above C++ function.
+void CreateFramePointerGrabberConstructor(const char* constructor_name) {
+    Local<v8::FunctionTemplate> constructor_template =
+        v8::FunctionTemplate::New(construct_call);
+    constructor_template->SetClassName(v8_str("FPGrabber"));
+    Local<Function> fun = constructor_template->GetFunction();
+    env->Global()->Set(v8_str(constructor_name), fun);
 }
-
-
-static void CheckObjectIsJSFunction(const char* func_name,
-                                    Address addr) {
-  i::Object* obj = reinterpret_cast<i::Object*>(addr);
-  CHECK(obj->IsJSFunction());
-  CHECK(JSFunction::cast(obj)->shared()->name()->IsString());
-  i::SmartPointer<char> found_name =
-      i::String::cast(
-          JSFunction::cast(
-              obj)->shared()->name())->ToCString();
-  CHECK_EQ(func_name, *found_name);
-}
-
-
-static void SetGlobalProperty(const char* name, Local<Value> value) {
-  env->Global()->Set(String::New(name), value);
-}
-
-
-static Handle<v8::internal::String> NewString(const char* s) {
-  return i::Factory::NewStringFromAscii(i::CStrVector(s));
-}
-
-
-namespace v8 {
-namespace internal {
-
-class CodeGeneratorPatcher {
- public:
-  CodeGeneratorPatcher() {
-    CodeGenerator::InlineRuntimeLUT gen_get_frame_pointer =
-        {&CodeGenerator::GenerateGetFramePointer, "_GetFramePointer", 0};
-    // _RandomHeapNumber is just used as a dummy function that has zero
-    // arguments, the same as the _GetFramePointer function we actually patch
-    // in.
-    bool result = CodeGenerator::PatchInlineRuntimeEntry(
-        NewString("_RandomHeapNumber"),
-        gen_get_frame_pointer, &old_inline_entry);
-    CHECK(result);
-  }
-
-  ~CodeGeneratorPatcher() {
-    CHECK(CodeGenerator::PatchInlineRuntimeEntry(
-        NewString("_GetFramePointer"),
-        old_inline_entry, NULL));
-  }
-
- private:
-  CodeGenerator::InlineRuntimeLUT old_inline_entry;
-};
-
-} }  // namespace v8::internal
 
 
 // Creates a global function named 'func_name' that calls the tracing
 // function 'trace_func_name' with an actual EBP register value,
-// shifted right to be presented as Smi.
+// encoded as one or two Smis.
 static void CreateTraceCallerFunction(const char* func_name,
                                       const char* trace_func_name) {
   i::EmbeddedVector<char, 256> trace_call_buf;
-  i::OS::SNPrintF(trace_call_buf, "%s(%%_GetFramePointer());", trace_func_name);
+  i::OS::SNPrintF(trace_call_buf,
+                  "function %s() {"
+                  "  fp = new FPGrabber();"
+                  "  %s(fp.low_bits, fp.high_bits);"
+                  "}",
+                  func_name, trace_func_name);
+
+  // Create the FPGrabber function, which grabs the caller's frame pointer
+  // when called as a constructor.
+  CreateFramePointerGrabberConstructor("FPGrabber");
 
   // Compile the script.
-  i::CodeGeneratorPatcher patcher;
-  bool allow_natives_syntax = i::FLAG_allow_natives_syntax;
-  i::FLAG_allow_natives_syntax = true;
-  Handle<JSFunction> func = CompileFunction(trace_call_buf.start());
-  CHECK(!func.is_null());
-  i::FLAG_allow_natives_syntax = allow_natives_syntax;
-  func->shared()->set_name(*NewString(func_name));
-
-#ifdef DEBUG
-  v8::internal::Code* func_code = func->code();
-  CHECK(func_code->IsCode());
-  func_code->Print();
-#endif
-
-  SetGlobalProperty(func_name, v8::ToApi<Value>(func));
-  CHECK_EQ(*func, *GetGlobalJSFunction(func_name));
+  CompileRun(trace_call_buf.start());
 }
 
 
 // This test verifies that stack tracing works when called during
 // execution of a native function called from JS code. In this case,
-// StackTracer uses Top::c_entry_fp as a starting point for stack
+// StackTracer uses Isolate::c_entry_fp as a starting point for stack
 // walking.
 TEST(CFromJSStackTrace) {
-  // TODO(711): The hack of replacing the inline runtime function
-  // RandomHeapNumber with GetFrameNumber does not work with the way
-  // the full compiler generates inline runtime calls.
-  i::FLAG_full_compiler = false;
-  i::FLAG_always_full_compiler = false;
+  // BUG(1303) Inlining of JSFuncDoTrace() in JSTrace below breaks this test.
+  i::FLAG_use_inlining = false;
 
   TickSample sample;
   InitTraceEnv(&sample);
@@ -298,27 +297,30 @@ TEST(CFromJSStackTrace) {
   // script [JS]
   //   JSTrace() [JS]
   //     JSFuncDoTrace() [JS] [captures EBP value and encodes it as Smi]
-  //       trace(EBP encoded as Smi) [native (extension)]
+  //       trace(EBP) [native (extension)]
   //         DoTrace(EBP) [native]
   //           StackTracer::Trace
-  CHECK_GT(sample.frames_count, 1);
+
+  CHECK(sample.has_external_callback);
+  CHECK_EQ(FUNCTION_ADDR(TraceExtension::Trace), sample.external_callback);
+
   // Stack tracing will start from the first JS function, i.e. "JSFuncDoTrace"
-  CheckObjectIsJSFunction("JSFuncDoTrace", sample.stack[0]);
-  CheckObjectIsJSFunction("JSTrace", sample.stack[1]);
+  int base = 0;
+  CHECK_GT(sample.frames_count, base + 1);
+  CHECK(IsAddressWithinFuncCode("JSFuncDoTrace", sample.stack[base + 0]));
+  CHECK(IsAddressWithinFuncCode("JSTrace", sample.stack[base + 1]));
 }
 
 
 // This test verifies that stack tracing works when called during
 // execution of JS code. However, as calling StackTracer requires
 // entering native code, we can only emulate pure JS by erasing
-// Top::c_entry_fp value. In this case, StackTracer uses passed frame
+// Isolate::c_entry_fp value. In this case, StackTracer uses passed frame
 // pointer value as a starting point for stack walking.
 TEST(PureJSStackTrace) {
-  // TODO(711): The hack of replacing the inline runtime function
-  // RandomHeapNumber with GetFrameNumber does not work with the way
-  // the full compiler generates inline runtime calls.
-  i::FLAG_full_compiler = false;
-  i::FLAG_always_full_compiler = false;
+  // This test does not pass with inlining enabled since inlined functions
+  // don't appear in the stack trace.
+  i::FLAG_use_inlining = false;
 
   TickSample sample;
   InitTraceEnv(&sample);
@@ -342,19 +344,20 @@ TEST(PureJSStackTrace) {
   // script [JS]
   //   OuterJSTrace() [JS]
   //     JSTrace() [JS]
-  //       JSFuncDoTrace() [JS] [captures EBP value and encodes it as Smi]
-  //         js_trace(EBP encoded as Smi) [native (extension)]
+  //       JSFuncDoTrace() [JS]
+  //         js_trace(EBP) [native (extension)]
   //           DoTraceHideCEntryFPAddress(EBP) [native]
   //             StackTracer::Trace
   //
-  // The last JS function called. It is only visible through
-  // sample.function, as its return address is above captured EBP value.
-  CHECK_EQ(GetGlobalJSFunction("JSFuncDoTrace")->address(),
-           sample.function);
-  CHECK_GT(sample.frames_count, 1);
+
+  CHECK(sample.has_external_callback);
+  CHECK_EQ(FUNCTION_ADDR(TraceExtension::JSTrace), sample.external_callback);
+
   // Stack sampling will start from the caller of JSFuncDoTrace, i.e. "JSTrace"
-  CheckObjectIsJSFunction("JSTrace", sample.stack[0]);
-  CheckObjectIsJSFunction("OuterJSTrace", sample.stack[1]);
+  int base = 0;
+  CHECK_GT(sample.frames_count, base + 1);
+  CHECK(IsAddressWithinFuncCode("JSTrace", sample.stack[base + 0]));
+  CHECK(IsAddressWithinFuncCode("OuterJSTrace", sample.stack[base + 1]));
 }
 
 
@@ -389,6 +392,7 @@ static int CFunc(int depth) {
 TEST(PureCStackTrace) {
   TickSample sample;
   InitTraceEnv(&sample);
+  InitializeVM();
   // Check that sampler doesn't crash
   CHECK_EQ(10, CFunc(10));
 }
@@ -405,5 +409,3 @@ TEST(JsEntrySp) {
   CompileRun("js_entry_sp_level2();");
   CHECK_EQ(0, GetJsEntrySp());
 }
-
-#endif  // ENABLE_LOGGING_AND_PROFILING

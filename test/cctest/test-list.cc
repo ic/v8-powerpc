@@ -1,4 +1,4 @@
-// Copyright 2009 the V8 project authors. All rights reserved.
+// Copyright 2011 the V8 project authors. All rights reserved.
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are
 // met:
@@ -97,5 +97,55 @@ TEST(ListAddAll) {
   CHECK_EQ(6, list.length());
   for (int i = 0; i < 6; i++) {
     CHECK_EQ(i % 3, list[i]);
+  }
+}
+
+
+TEST(RemoveLast) {
+  List<int> list(4);
+  CHECK_EQ(0, list.length());
+  list.Add(1);
+  CHECK_EQ(1, list.length());
+  CHECK_EQ(1, list.last());
+  list.RemoveLast();
+  CHECK_EQ(0, list.length());
+  list.Add(2);
+  list.Add(3);
+  CHECK_EQ(2, list.length());
+  CHECK_EQ(3, list.last());
+  list.RemoveLast();
+  CHECK_EQ(1, list.length());
+  CHECK_EQ(2, list.last());
+  list.RemoveLast();
+  CHECK_EQ(0, list.length());
+
+  const int kElements = 100;
+  for (int i = 0; i < kElements; i++) list.Add(i);
+  for (int j = kElements - 1; j >= 0; j--) {
+    CHECK_EQ(j + 1, list.length());
+    CHECK_EQ(j, list.last());
+    list.RemoveLast();
+    CHECK_EQ(j, list.length());
+  }
+}
+
+
+TEST(Clear) {
+  List<int> list(4);
+  CHECK_EQ(0, list.length());
+  for (int i = 0; i < 4; ++i) list.Add(i);
+  CHECK_EQ(4, list.length());
+  list.Clear();
+  CHECK_EQ(0, list.length());
+}
+
+
+TEST(DeleteEmpty) {
+  {
+    List<int>* list = new List<int>(0);
+    delete list;
+  }
+  {
+    List<int> list(0);
   }
 }
