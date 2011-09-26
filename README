@@ -1,5 +1,7 @@
 Project to port the V8 JavaScript engine originated at Google to the PowerPC architecture.
 
 Short-term goal: Get V8 on PowerPC and PowerPC 64.
-Long-term goal: Get Google Chrome to PowerPC users.
+Long-term goal: Get Node.js and Google Chrome to PowerPC users.
+
+Current Status: No new code added yet due to a long pause. The approach followed here is based on advice for the MIPS port: http://goo.gl/TYMmh.
 
