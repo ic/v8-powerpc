@@ -212,6 +212,23 @@ LIBRARY_FLAGS = {
         'CPPDEFINES':    ['__mips_hard_float=1'],
       }
     },
+    'arch:ppc': {
+      'CPPDEFINES':   ['V8_TARGET_ARCH_PPC'],
+      'CXXFLAGS':     ['-bpowerpc'],
+      'CCFLAGS':      ['-m32'],
+      'LINKFLAGS':    ['-m32'],
+      'simulator:none': {
+        'CCFLAGS':      ['-EL'],
+        'LINKFLAGS':    ['-EL'],
+        'library:static': {
+          'LINKFLAGS':    ['-static', '-static-libgcc']
+        }
+      }
+    },
+    'simulator:ppc': {
+      'CCFLAGS':      ['-m32'],
+      'LINKFLAGS':    ['-m32'],
+    },
     'arch:x64': {
       'CPPDEFINES':   ['V8_TARGET_ARCH_X64'],
       'CCFLAGS':      ['-m64'],
@@ -946,7 +963,7 @@ def GuessStrictAliasing(env):
 
 PLATFORM_OPTIONS = {
   'arch': {
-    'values': ['arm', 'ia32', 'x64', 'mips'],
+    'values': ['arm', 'ia32', 'x64', 'mips', 'ppc'],
     'guess': GuessArch,
     'help': 'the architecture to build for'
   },
