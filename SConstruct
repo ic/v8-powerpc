@@ -215,8 +215,8 @@ LIBRARY_FLAGS = {
     'arch:ppc': {
       'CPPDEFINES':   ['V8_TARGET_ARCH_PPC'],
       'CXXFLAGS':     ['-bpowerpc'],
-      'CCFLAGS':      ['-m32'],
-      'LINKFLAGS':    ['-m32'],
+      'CCFLAGS':      ['-isysroot', '/Developer/SDKs/MacOSX10.4u.sdk', '-arch', 'ppc'],
+      'LINKFLAGS':    ['-syslibroot', '/Developer/SDKs/MacOSX10.4u.sdk', '-arch', 'ppc'],
       'simulator:none': {
         'CCFLAGS':      ['-EL'],
         'LINKFLAGS':    ['-EL'],
